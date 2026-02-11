@@ -1,0 +1,78 @@
+import promptData from "./promptData.json";
+import { getLanguageInstruction } from "../utils/languageSupport";
+
+export const CLEANUP_PROMPT = promptData.CLEANUP_PROMPT;
+export const FULL_PROMPT = promptData.FULL_PROMPT;
+/** @deprecated Use FULL_PROMPT instead — kept for PromptStudio backwards compat */
+export const UNIFIED_SYSTEM_PROMPT = promptData.FULL_PROMPT;
+export const LEGACY_PROMPTS = promptData.LEGACY_PROMPTS;
+const DICTIONARY_SUFFIX = promptData.DICTIONARY_SUFFIX;
+
+function detectAgentName(transcript: string, agentName: string): boolean {
+  const lower = transcript.toLowerCase();
+  const name = agentName.toLowerCase();
+
+  if (lower.includes(name)) return true;
+
+  // Add known ASR misspellings here as discovered through real usage.
+  const variants: string[] = [];
+
+  return variants.some((v) => lower.includes(v));
+}
+
+export function getSystemPrompt(
+  agentName: string | null,
+  customDictionary?: string[],
+  language?: string,
+  transcript?: string
+): string {
+  const name = agentName?.trim() || "Assistant";
+
+  // Check for custom prompt override first
+  let promptTemplate: string | null = null;
+  if (typeof window !== "undefined" && window.localStorage) {
+    const customPrompt = window.localStorage.getItem("customUnifiedPrompt");
+    if (customPrompt) {
+      try {
+        promptTemplate = JSON.parse(customPrompt);
+      } catch {
+        // Use default if parsing fails
+      }
+    }
+  }
+
+  // If user has a custom prompt, always use it (no tier split — they control the full prompt)
+  // Otherwise, select tier based on agent name detection
+  let prompt: string;
+  if (promptTemplate) {
+    prompt = promptTemplate.replace(/\{\{agentName\}\}/g, name);
+  } else {
+    const useFullPrompt = !transcript || detectAgentName(transcript, name);
+    prompt = (useFullPrompt ? FULL_PROMPT : CLEANUP_PROMPT).replace(/\{\{agentName\}\}/g, name);
+  }
+
+  const langInstruction = getLanguageInstruction(language);
+  if (langInstruction) {
+    prompt += "\n\n" + langInstruction;
+  }
+
+  if (customDictionary && customDictionary.length > 0) {
+    prompt += DICTIONARY_SUFFIX + customDictionary.join(", ");
+  }
+
+  return prompt;
+}
+
+export function getWordBoost(customDictionary?: string[]): string[] {
+  if (!customDictionary || customDictionary.length === 0) return [];
+  return customDictionary.filter((w) => w.trim());
+}
+
+export default {
+  CLEANUP_PROMPT,
+  FULL_PROMPT,
+  UNIFIED_SYSTEM_PROMPT,
+  getSystemPrompt,
+  getWordBoost,
+  LEGACY_PROMPTS,
+};

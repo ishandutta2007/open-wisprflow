@@ -1,0 +1,620 @@
+const { app, screen, BrowserWindow, shell, dialog } = require("electron");
+const HotkeyManager = require("./hotkeyManager");
+const DragManager = require("./dragManager");
+const MenuManager = require("./menuManager");
+const DevServerManager = require("./devServerManager");
+const { DEV_SERVER_PORT } = DevServerManager;
+const {
+  MAIN_WINDOW_CONFIG,
+  CONTROL_PANEL_CONFIG,
+  WINDOW_SIZES,
+  WindowPositionUtil,
+} = require("./windowConfig");
+
+class WindowManager {
+  constructor() {
+    this.mainWindow = null;
+    this.controlPanelWindow = null;
+    this.tray = null;
+    this.hotkeyManager = new HotkeyManager();
+    this.dragManager = new DragManager();
+    this.isQuitting = false;
+    this.isMainWindowInteractive = false;
+    this.loadErrorShown = false;
+    this.windowsPushToTalkAvailable = false;
+    this.macCompoundPushState = null;
+    this._cachedActivationMode = "tap";
+    this._floatingIconAutoHide = false;
+
+    app.on("before-quit", () => {
+      this.isQuitting = true;
+    });
+  }
+
+  setWindowsPushToTalkAvailable(available) {
+    this.windowsPushToTalkAvailable = available;
+  }
+
+  async createMainWindow() {
+    const display = screen.getPrimaryDisplay();
+    const position = WindowPositionUtil.getMainWindowPosition(display);
+
+    this.mainWindow = new BrowserWindow({
+      ...MAIN_WINDOW_CONFIG,
+      ...position,
+    });
+
+    // Main window (dictation overlay) should never appear in dock/taskbar
+    // On macOS, users access the app via the menu bar tray icon
+    // On Windows/Linux, the control panel stays in the taskbar when minimized
+    this.mainWindow.setSkipTaskbar(true);
+
+    this.setMainWindowInteractivity(false);
+    this.registerMainWindowEvents();
+
+    // Register load event handlers BEFORE loading to catch all events
+    this.mainWindow.webContents.on(
+      "did-fail-load",
+      async (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) {
+          return;
+        }
+        if (
+          process.env.NODE_ENV === "development" &&
+          validatedURL &&
+          validatedURL.includes(`localhost:${DEV_SERVER_PORT}`)
+        ) {
+          setTimeout(async () => {
+            const isReady = await DevServerManager.waitForDevServer();
+            if (isReady) {
+              this.mainWindow.reload();
+            }
+          }, 2000);
+        } else {
+          this.showLoadFailureDialog("Dictation panel", errorCode, errorDescription, validatedURL);
+        }
+      }
+    );
+
+    this.mainWindow.webContents.on("did-finish-load", () => {
+      this.mainWindow.setTitle("Voice Recorder");
+      this.enforceMainWindowOnTop();
+    });
+
+    await this.loadMainWindow();
+    await this.initializeHotkey();
+    this.dragManager.setTargetWindow(this.mainWindow);
+    MenuManager.setupMainMenu();
+  }
+
+  setMainWindowInteractivity(shouldCapture) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return;
+    }
+
+    if (shouldCapture) {
+      this.mainWindow.setIgnoreMouseEvents(false);
+    } else {
+      this.mainWindow.setIgnoreMouseEvents(true, { forward: true });
+    }
+    this.isMainWindowInteractive = shouldCapture;
+  }
+
+  resizeMainWindow(sizeKey) {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return { success: false, message: "Window not available" };
+    }
+
+    const newSize = WINDOW_SIZES[sizeKey] || WINDOW_SIZES.BASE;
+    const currentBounds = this.mainWindow.getBounds();
+
+    const bottomRightX = currentBounds.x + currentBounds.width;
+    const bottomRightY = currentBounds.y + currentBounds.height;
+
+    const display = screen.getDisplayNearestPoint({ x: bottomRightX, y: bottomRightY });
+    const workArea = display.workArea || display.bounds;
+
+    let newX = bottomRightX - newSize.width;
+    let newY = bottomRightY - newSize.height;
+
+    newX = Math.max(workArea.x, Math.min(newX, workArea.x + workArea.width - newSize.width));
+    newY = Math.max(workArea.y, Math.min(newY, workArea.y + workArea.height - newSize.height));
+
+    this.mainWindow.setBounds({
+      x: newX,
+      y: newY,
+      width: newSize.width,
+      height: newSize.height,
+    });
+
+    return { success: true, bounds: { x: newX, y: newY, ...newSize } };
+  }
+
+  async loadWindowContent(window, isControlPanel = false) {
+    if (process.env.NODE_ENV === "development") {
+      const appUrl = DevServerManager.getAppUrl(isControlPanel);
+      await DevServerManager.waitForDevServer();
+      await window.loadURL(appUrl);
+    } else {
+      // Production: use loadFile() for better compatibility with Electron 36+
+      const fileInfo = DevServerManager.getAppFilePath(isControlPanel);
+      if (!fileInfo) {
+        throw new Error("Failed to get app file path");
+      }
+
+      const fs = require("fs");
+      if (!fs.existsSync(fileInfo.path)) {
+        throw new Error(`HTML file not found: ${fileInfo.path}`);
+      }
+
+      await window.loadFile(fileInfo.path, { query: fileInfo.query });
+    }
+  }
+
+  async loadMainWindow() {
+    await this.loadWindowContent(this.mainWindow, false);
+  }
+
+  createHotkeyCallback() {
+    let lastToggleTime = 0;
+    const DEBOUNCE_MS = 150;
+
+    return async () => {
+      if (this.hotkeyManager.isInListeningMode()) {
+        return;
+      }
+
+      const activationMode = await this.getActivationMode();
+      const currentHotkey = this.hotkeyManager.getCurrentHotkey?.();
+
+      if (
+        process.platform === "darwin" &&
+        activationMode === "push" &&
+        currentHotkey &&
+        currentHotkey !== "GLOBE" &&
+        currentHotkey.includes("+")
+      ) {
+        this.startMacCompoundPushToTalk(currentHotkey);
+        return;
+      }
+
+      // Windows push mode: defer to windowsKeyManager if available, else fall through to toggle
+      if (process.platform === "win32" && this.windowsPushToTalkAvailable) {
+        if (activationMode === "push") {
+          return;
+        }
+      }
+
+      const now = Date.now();
+      if (now - lastToggleTime < DEBOUNCE_MS) {
+        return;
+      }
+      lastToggleTime = now;
+
+      this.showDictationPanel();
+      this.mainWindow.webContents.send("toggle-dictation");
+    };
+  }
+
+  startMacCompoundPushToTalk(hotkey) {
+    if (this.macCompoundPushState?.active) {
+      return;
+    }
+
+    const requiredModifiers = this.getMacRequiredModifiers(hotkey);
+    if (requiredModifiers.size === 0) {
+      return;
+    }
+
+    const MIN_HOLD_DURATION_MS = 150;
+    const MAX_PUSH_DURATION_MS = 300000; // 5 minutes max recording
+    const downTime = Date.now();
+
+    this.showDictationPanel();
+
+    const safetyTimeoutId = setTimeout(() => {
+      if (this.macCompoundPushState?.active) {
+        console.warn("[WindowManager] Compound PTT safety timeout triggered - stopping recording");
+        this.forceStopMacCompoundPush("timeout");
+      }
+    }, MAX_PUSH_DURATION_MS);
+
+    this.macCompoundPushState = {
+      active: true,
+      downTime,
+      isRecording: false,
+      requiredModifiers,
+      safetyTimeoutId,
+    };
+
+    setTimeout(() => {
+      if (!this.macCompoundPushState || this.macCompoundPushState.downTime !== downTime) {
+        return;
+      }
+
+      if (!this.macCompoundPushState.isRecording) {
+        this.macCompoundPushState.isRecording = true;
+        this.sendStartDictation();
+      }
+    }, MIN_HOLD_DURATION_MS);
+  }
+
+  handleMacPushModifierUp(modifier) {
+    if (!this.macCompoundPushState?.active) {
+      return;
+    }
+
+    if (!this.macCompoundPushState.requiredModifiers.has(modifier)) {
+      return;
+    }
+
+    if (this.macCompoundPushState.safetyTimeoutId) {
+      clearTimeout(this.macCompoundPushState.safetyTimeoutId);
+    }
+
+    const wasRecording = this.macCompoundPushState.isRecording;
+    this.macCompoundPushState = null;
+
+    if (wasRecording) {
+      this.sendStopDictation();
+    } else {
+      this.hideDictationPanel();
+    }
+  }
+
+  forceStopMacCompoundPush(reason = "manual") {
+    if (!this.macCompoundPushState) {
+      return;
+    }
+
+    if (this.macCompoundPushState.safetyTimeoutId) {
+      clearTimeout(this.macCompoundPushState.safetyTimeoutId);
+    }
+
+    const wasRecording = this.macCompoundPushState.isRecording;
+    this.macCompoundPushState = null;
+
+    if (wasRecording) {
+      this.sendStopDictation();
+    }
+    this.hideDictationPanel();
+
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("compound-ptt-force-stopped", { reason });
+    }
+  }
+
+  getMacRequiredModifiers(hotkey) {
+    const required = new Set();
+    const parts = hotkey.split("+").map((part) => part.trim());
+
+    for (const part of parts) {
+      switch (part) {
+        case "Command":
+        case "Cmd":
+        case "CommandOrControl":
+        case "Super":
+        case "Meta":
+          required.add("command");
+          break;
+        case "Control":
+        case "Ctrl":
+          required.add("control");
+          break;
+        case "Alt":
+        case "Option":
+          required.add("option");
+          break;
+        case "Shift":
+          required.add("shift");
+          break;
+        case "Fn":
+          required.add("fn");
+          break;
+        default:
+          break;
+      }
+    }
+
+    return required;
+  }
+
+  sendStartDictation() {
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.showDictationPanel();
+      this.mainWindow.webContents.send("start-dictation");
+    }
+  }
+
+  sendStopDictation() {
+    if (this.hotkeyManager.isInListeningMode()) {
+      return;
+    }
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      this.mainWindow.webContents.send("stop-dictation");
+    }
+  }
+
+  getActivationMode() {
+    return this._cachedActivationMode;
+  }
+
+  setActivationModeCache(mode) {
+    this._cachedActivationMode = mode === "push" ? "push" : "tap";
+  }
+
+  setFloatingIconAutoHide(enabled) {
+    this._floatingIconAutoHide = Boolean(enabled);
+  }
+
+  setHotkeyListeningMode(enabled) {
+    this.hotkeyManager.setListeningMode(enabled);
+  }
+
+  async initializeHotkey() {
+    await this.hotkeyManager.initializeHotkey(this.mainWindow, this.createHotkeyCallback());
+  }
+
+  async updateHotkey(hotkey) {
+    return await this.hotkeyManager.updateHotkey(hotkey, this.createHotkeyCallback());
+  }
+
+  isUsingGnomeHotkeys() {
+    return this.hotkeyManager.isUsingGnome();
+  }
+
+  async startWindowDrag() {
+    return await this.dragManager.startWindowDrag();
+  }
+
+  async stopWindowDrag() {
+    return await this.dragManager.stopWindowDrag();
+  }
+
+  openExternalUrl(url, showError = true) {
+    shell.openExternal(url).catch((error) => {
+      if (showError) {
+        dialog.showErrorBox(
+          "Unable to Open Link",
+          `Failed to open the link in your browser:\n${url}\n\nError: ${error.message}`
+        );
+      }
+    });
+  }
+
+  async createControlPanelWindow() {
+    if (this.controlPanelWindow && !this.controlPanelWindow.isDestroyed()) {
+      if (this.controlPanelWindow.isMinimized()) {
+        this.controlPanelWindow.restore();
+      }
+      if (!this.controlPanelWindow.isVisible()) {
+        this.controlPanelWindow.show();
+      }
+      this.controlPanelWindow.focus();
+      return;
+    }
+
+    this.controlPanelWindow = new BrowserWindow(CONTROL_PANEL_CONFIG);
+
+    this.controlPanelWindow.webContents.on("will-navigate", (event, url) => {
+      const appUrl = DevServerManager.getAppUrl(true);
+      const controlPanelUrl = appUrl.startsWith("http") ? appUrl : `file://${appUrl}`;
+
+      if (
+        url.startsWith(controlPanelUrl) ||
+        url.startsWith("file://") ||
+        url.startsWith("devtools://")
+      ) {
+        return;
+      }
+
+      event.preventDefault();
+      this.openExternalUrl(url);
+    });
+
+    this.controlPanelWindow.webContents.setWindowOpenHandler(({ url }) => {
+      this.openExternalUrl(url);
+      return { action: "deny" };
+    });
+
+    this.controlPanelWindow.webContents.on("did-create-window", (childWindow, details) => {
+      childWindow.close();
+      if (details.url && !details.url.startsWith("devtools://")) {
+        this.openExternalUrl(details.url, false);
+      }
+    });
+
+    const visibilityTimer = setTimeout(() => {
+      if (!this.controlPanelWindow || this.controlPanelWindow.isDestroyed()) {
+        return;
+      }
+      if (!this.controlPanelWindow.isVisible()) {
+        this.controlPanelWindow.show();
+        this.controlPanelWindow.focus();
+      }
+    }, 10000);
+
+    const clearVisibilityTimer = () => {
+      clearTimeout(visibilityTimer);
+    };
+
+    this.controlPanelWindow.once("ready-to-show", () => {
+      clearVisibilityTimer();
+      if (process.platform === "darwin" && app.dock) {
+        app.dock.show();
+      }
+      this.controlPanelWindow.show();
+      this.controlPanelWindow.focus();
+    });
+
+    this.controlPanelWindow.on("close", (event) => {
+      if (!this.isQuitting) {
+        event.preventDefault();
+        if (process.platform === "darwin") {
+          this.hideControlPanelToTray();
+        } else {
+          this.controlPanelWindow.minimize();
+        }
+      }
+    });
+
+    this.controlPanelWindow.on("closed", () => {
+      clearVisibilityTimer();
+      this.controlPanelWindow = null;
+    });
+
+    MenuManager.setupControlPanelMenu(this.controlPanelWindow);
+
+    this.controlPanelWindow.webContents.on("did-finish-load", () => {
+      clearVisibilityTimer();
+      this.controlPanelWindow.setTitle("Control Panel");
+    });
+
+    this.controlPanelWindow.webContents.on(
+      "did-fail-load",
+      (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+        if (!isMainFrame) {
+          return;
+        }
+        clearVisibilityTimer();
+        if (process.env.NODE_ENV !== "development") {
+          this.showLoadFailureDialog("Control panel", errorCode, errorDescription, validatedURL);
+        }
+        if (!this.controlPanelWindow.isVisible()) {
+          this.controlPanelWindow.show();
+          this.controlPanelWindow.focus();
+        }
+      }
+    );
+
+    await this.loadControlPanel();
+  }
+
+  async loadControlPanel() {
+    await this.loadWindowContent(this.controlPanelWindow, true);
+  }
+
+  showDictationPanel(options = {}) {
+    const { focus = false } = options;
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      if (!this.mainWindow.isVisible()) {
+        if (typeof this.mainWindow.showInactive === "function") {
+          this.mainWindow.showInactive();
+        } else {
+          this.mainWindow.show();
+        }
+      }
+      if (focus) {
+        this.mainWindow.focus();
+      }
+    }
+  }
+
+  hideControlPanelToTray() {
+    if (!this.controlPanelWindow || this.controlPanelWindow.isDestroyed()) {
+      return;
+    }
+
+    this.controlPanelWindow.hide();
+
+    if (process.platform === "darwin" && app.dock) {
+      app.dock.hide();
+    }
+  }
+
+  hideDictationPanel() {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      if (process.platform === "darwin") {
+        this.mainWindow.hide();
+      } else {
+        this.mainWindow.minimize();
+      }
+    }
+  }
+
+  isDictationPanelVisible() {
+    if (!this.mainWindow || this.mainWindow.isDestroyed()) {
+      return false;
+    }
+
+    if (this.mainWindow.isMinimized && this.mainWindow.isMinimized()) {
+      return false;
+    }
+
+    return this.mainWindow.isVisible();
+  }
+
+  registerMainWindowEvents() {
+    if (!this.mainWindow) {
+      return;
+    }
+
+    // Safety timeout: force show the window if ready-to-show doesn't fire within 10 seconds
+    const showTimeout = setTimeout(() => {
+      if (
+        this.mainWindow &&
+        !this.mainWindow.isDestroyed() &&
+        !this.mainWindow.isVisible() &&
+        !this._floatingIconAutoHide
+      ) {
+        this.showDictationPanel();
+      }
+    }, 10000);
+
+    this.mainWindow.once("ready-to-show", () => {
+      clearTimeout(showTimeout);
+      this.enforceMainWindowOnTop();
+      if (!this.mainWindow.isVisible() && !this._floatingIconAutoHide) {
+        if (typeof this.mainWindow.showInactive === "function") {
+          this.mainWindow.showInactive();
+        } else {
+          this.mainWindow.show();
+        }
+      }
+    });
+
+    this.mainWindow.on("show", () => {
+      this.enforceMainWindowOnTop();
+    });
+
+    this.mainWindow.on("focus", () => {
+      this.enforceMainWindowOnTop();
+    });
+
+    this.mainWindow.on("closed", () => {
+      this.dragManager.cleanup();
+      this.mainWindow = null;
+      this.isMainWindowInteractive = false;
+    });
+  }
+
+  enforceMainWindowOnTop() {
+    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      WindowPositionUtil.setupAlwaysOnTop(this.mainWindow);
+    }
+  }
+
+  showLoadFailureDialog(windowName, errorCode, errorDescription, validatedURL) {
+    if (this.loadErrorShown) {
+      return;
+    }
+    this.loadErrorShown = true;
+    const detailLines = [
+      `Window: ${windowName}`,
+      `Error ${errorCode}: ${errorDescription}`,
+      validatedURL ? `URL: ${validatedURL}` : null,
+      "Try reinstalling the app or launching with --log-level=debug.",
+    ].filter(Boolean);
+    dialog.showMessageBox({
+      type: "error",
+      title: "OpenWhispr failed to load",
+      message: "OpenWhispr could not load its UI.",
+      detail: detailLines.join("\n"),
+    });
+  }
+}
+
+module.exports = WindowManager;
