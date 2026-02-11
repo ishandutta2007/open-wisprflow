@@ -44,4 +44,12 @@ OpenWhisperFlow is released under the MIT License. See the `LICENSE` file for mo
 
 ## 📧 Contact
 
+ishandutta2007@gmail.com
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=ishandutta2007/open-wisprflow&type=date&legend=top-left)](https://www.star-history.com/#ishandutta2007/open-wisprflow&type=date&legend=top-left)
+
+
+
 Have questions or need support? Reach out to us at [your-email@example.com] or join our community forum/Discord server.
